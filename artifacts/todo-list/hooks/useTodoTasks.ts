@@ -93,10 +93,15 @@ function mergeTasks(remoteTasks: Task[], localTasks: Task[], deletedIds: Set<str
 
 function describeCloudError(error: unknown) {
   const message = error instanceof Error ? error.message.toLowerCase() : '';
-  const status =
-    error && typeof error === 'object' && 'status' in error
-      ? (error as { status?: unknown }).status
-      : undefined;
+  const details =
+    error && typeof error === 'object'
+      ? (error as { status?: unknown; code?: unknown })
+      : {};
+  const status = details.status;
+  const code =
+    typeof details.code === 'string' && /^[a-z\d_-]{1,64}$/i.test(details.code)
+      ? details.code.toLowerCase()
+      : null;
 
   if (message.includes('missing')) {
     return 'Add the Supabase project URL and publishable/anon key in Replit Secrets, then retry.';
@@ -110,6 +115,12 @@ function describeCloudError(error: unknown) {
     message.includes('invalid jwt')
   ) {
     return 'Supabase rejected the connection. Check that the project URL and publishable/anon key belong to the same project.';
+  }
+  if (status === 422) {
+    if (message.includes('captcha') || code?.includes('captcha')) {
+      return 'Supabase requires CAPTCHA verification for anonymous sign-in. Disable that requirement or configure CAPTCHA, then retry.';
+    }
+    return `Supabase rejected anonymous sign-in (HTTP 422${code ? `, ${code}` : ''}). Check Auth logs for the project URL used by this app.`;
   }
   if (message.includes('anonymous') || message.includes('sign in')) {
     return 'Enable anonymous sign-ins in Supabase, then retry.';
