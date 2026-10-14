@@ -101,6 +101,9 @@ function describeCloudError(error: unknown) {
   if (message.includes('missing')) {
     return 'Add the Supabase project URL and publishable/anon key in Replit Secrets, then retry.';
   }
+  if (message.includes('invalid supabase project url')) {
+    return 'Use the full Supabase Project URL, starting with https://, in EXPO_PUBLIC_SUPABASE_URL.';
+  }
   if (
     status === 401 ||
     message.includes('invalid api key') ||
