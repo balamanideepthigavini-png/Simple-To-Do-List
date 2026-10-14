@@ -1,8 +1,7 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { StatusBar } from 'expo-status-bar';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -16,29 +15,10 @@ import {
 } from 'react-native';
 import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTodoTasks, type Task } from '@/hooks/useTodoTasks';
 import { useColors } from '@/hooks/useColors';
 
-type Task = {
-  id: string;
-  title: string;
-  completed: boolean;
-};
-
 type Filter = 'all' | 'active' | 'completed';
-type LoadState = 'loading' | 'ready' | 'error';
-type SaveState = 'saved' | 'saving' | 'error';
-
-const STORAGE_KEY = '@todo-list/tasks-v1';
-
-function isTask(value: unknown): value is Task {
-  if (!value || typeof value !== 'object') return false;
-  const task = value as Record<string, unknown>;
-  return (
-    typeof task.id === 'string' &&
-    typeof task.title === 'string' &&
-    typeof task.completed === 'boolean'
-  );
-}
 
 function todayLabel() {
   return new Intl.DateTimeFormat(undefined, {
@@ -55,50 +35,23 @@ export default function TodoScreen() {
   const webTopInset = Platform.OS === 'web' ? Math.max(insets.top, 67) : insets.top;
   const webBottomInset = Platform.OS === 'web' ? 34 : insets.bottom;
 
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [loadState, setLoadState] = useState<LoadState>('loading');
-  const [saveState, setSaveState] = useState<SaveState>('saved');
-  const [saveAttempt, setSaveAttempt] = useState(0);
+  const {
+    tasks,
+    loadState,
+    loadError,
+    saveState,
+    cloudState,
+    cloudMessage,
+    addTask: createTask,
+    toggleTask,
+    deleteTask,
+    retryLoad,
+    retrySave,
+    retryCloud,
+  } = useTodoTasks();
   const [draft, setDraft] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
-  const writeQueue = useRef<Promise<void>>(Promise.resolve());
-
-  const loadTasks = useCallback(async () => {
-    setLoadState('loading');
-    try {
-      const stored = await AsyncStorage.getItem(STORAGE_KEY);
-      if (stored === null) {
-        setTasks([]);
-      } else {
-        const parsed: unknown = JSON.parse(stored);
-        if (!Array.isArray(parsed) || !parsed.every(isTask)) {
-          throw new Error('Saved tasks have an unexpected format.');
-        }
-        setTasks(parsed);
-      }
-      setLoadState('ready');
-    } catch {
-      setLoadState('error');
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadTasks();
-  }, [loadTasks]);
-
-  useEffect(() => {
-    if (loadState !== 'ready') return;
-
-    const snapshot = JSON.stringify(tasks);
-    writeQueue.current = writeQueue.current
-      .catch(() => undefined)
-      .then(async () => {
-        setSaveState('saving');
-        await AsyncStorage.setItem(STORAGE_KEY, snapshot);
-      })
-      .then(() => setSaveState('saved'))
-      .catch(() => setSaveState('error'));
-  }, [loadState, saveAttempt, tasks]);
+  const actionsDisabled = loadState !== 'ready' || cloudState === 'connecting';
 
   const completedCount = useMemo(
     () => tasks.reduce((total, task) => total + Number(task.completed), 0),
@@ -117,38 +70,13 @@ export default function TodoScreen() {
   const progress = tasks.length === 0 ? 0 : Math.round((completedCount / tasks.length) * 100);
 
   const addTask = useCallback(() => {
-    const title = draft.trim();
-    if (!title || loadState !== 'ready') return;
-
-    setTasks((current) => [
-      ...current,
-      {
-        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
-        title,
-        completed: false,
-      },
-    ]);
+    if (!createTask(draft)) return;
     setDraft('');
     Keyboard.dismiss();
     if (Platform.OS !== 'web') {
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     }
-  }, [draft, loadState]);
-
-  const toggleTask = useCallback((id: string) => {
-    setTasks((current) =>
-      current.map((task) =>
-        task.id === id ? { ...task, completed: !task.completed } : task,
-      ),
-    );
-    if (Platform.OS !== 'web') {
-      void Haptics.selectionAsync().catch(() => undefined);
-    }
-  }, []);
-
-  const deleteTask = useCallback((id: string) => {
-    setTasks((current) => current.filter((task) => task.id !== id));
-  }, []);
+  }, [createTask, draft]);
 
   const filters: { key: Filter; label: string; count: number }[] = [
     { key: 'all', label: 'All', count: tasks.length },
@@ -185,6 +113,7 @@ export default function TodoScreen() {
         accessibilityRole="checkbox"
         accessibilityLabel={`${item.completed ? 'Mark as open' : 'Complete'}: ${item.title}`}
         accessibilityState={{ checked: item.completed }}
+        disabled={actionsDisabled}
         onPress={() => toggleTask(item.id)}
         style={({ pressed }) => [
           styles.checkButton,
@@ -216,6 +145,7 @@ export default function TodoScreen() {
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Delete ${item.title}`}
+        disabled={actionsDisabled}
         onPress={() => deleteTask(item.id)}
         hitSlop={10}
         style={({ pressed }) => [styles.deleteButton, { opacity: pressed ? 0.55 : 1 }]}
@@ -257,10 +187,18 @@ export default function TodoScreen() {
                 A SMALL STEP
               </Text>
               <View style={{ flex: 1 }} />
-              {loadState === 'loading' ? (
+              {cloudState === 'connecting' || cloudState === 'syncing' ? (
                 <ActivityIndicator size="small" color={colors.primary} />
               ) : (
-                <View style={[styles.dateDot, { backgroundColor: colors.primary }]} />
+                <View
+                  style={[
+                    styles.dateDot,
+                    {
+                      backgroundColor:
+                        cloudState === 'connected' ? colors.primary : colors.destructive,
+                    },
+                  ]}
+                />
               )}
             </View>
 
@@ -357,13 +295,13 @@ export default function TodoScreen() {
                     Couldn’t load your saved tasks
                   </Text>
                   <Text style={[styles.errorMessage, { color: colors.mutedForeground }]}>
-                    Your existing list is untouched. Try loading it again.
+                    {loadError}
                   </Text>
                 </View>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Retry loading tasks"
-                  onPress={() => void loadTasks()}
+                  onPress={retryLoad}
                   style={styles.retryButton}
                   testID="retry-load"
                 >
@@ -372,17 +310,40 @@ export default function TodoScreen() {
               </View>
             ) : null}
 
+            {loadState === 'ready' && cloudState === 'error' ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Retry connecting to Supabase"
+                onPress={retryCloud}
+                style={[styles.errorPanel, { backgroundColor: colors.accent }]}
+                testID="retry-supabase"
+              >
+                <Ionicons name="cloud-offline-outline" size={20} color={colors.primary} />
+                <View style={styles.errorTextWrap}>
+                  <Text style={[styles.errorTitle, { color: colors.foreground }]}>
+                    Not connected to Supabase
+                  </Text>
+                  <Text style={[styles.errorMessage, { color: colors.mutedForeground }]}>
+                    {cloudMessage ?? 'Your list is saved on this device. Tap to retry.'}
+                  </Text>
+                </View>
+                <View style={styles.retryButton}>
+                  <Ionicons name="refresh" size={18} color={colors.primary} />
+                </View>
+              </Pressable>
+            ) : null}
+
             {loadState === 'ready' && saveState === 'error' ? (
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel="Retry saving tasks"
-                onPress={() => setSaveAttempt((attempt) => attempt + 1)}
+                accessibilityLabel="Retry saving tasks on this device"
+                onPress={retrySave}
                 style={[styles.saveNotice, { backgroundColor: colors.accent }]}
                 testID="retry-save"
               >
                 <Ionicons name="alert-circle-outline" size={17} color={colors.primary} />
                 <Text style={[styles.saveNoticeText, { color: colors.accentForeground }]}>
-                  Changes aren’t saved yet. Tap to retry.
+                  Couldn’t save locally. Tap to retry.
                 </Text>
               </Pressable>
             ) : null}
@@ -415,7 +376,7 @@ export default function TodoScreen() {
             <View style={styles.savingState}>
               <ActivityIndicator size="small" color={colors.mutedForeground} />
               <Text style={[styles.savingText, { color: colors.mutedForeground }]}>
-                Saving on this device
+                Saving your list
               </Text>
             </View>
           ) : null
@@ -443,7 +404,7 @@ export default function TodoScreen() {
         >
           <TextInput
             accessibilityLabel="New task"
-            editable={loadState === 'ready'}
+            editable={!actionsDisabled}
             maxLength={120}
             onChangeText={setDraft}
             onSubmitEditing={addTask}
@@ -457,13 +418,13 @@ export default function TodoScreen() {
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="Add task"
-            disabled={!draft.trim() || loadState !== 'ready'}
+            disabled={!draft.trim() || actionsDisabled}
             onPress={addTask}
             style={({ pressed }) => [
               styles.addButton,
               {
                 backgroundColor: colors.primary,
-                opacity: !draft.trim() || loadState !== 'ready' ? 0.45 : pressed ? 0.78 : 1,
+                opacity: !draft.trim() || actionsDisabled ? 0.45 : pressed ? 0.78 : 1,
               },
             ]}
             testID="add-task"
@@ -472,7 +433,13 @@ export default function TodoScreen() {
           </Pressable>
         </View>
         <Text style={[styles.footerHint, { color: colors.mutedForeground }]}>
-          Saved just for you, on this device
+          {cloudState === 'connected'
+            ? 'Synced with Supabase'
+            : cloudState === 'syncing'
+              ? 'Syncing with Supabase…'
+              : cloudState === 'connecting'
+                ? 'Connecting to Supabase…'
+                : 'Saved on this device · not synced'}
         </Text>
       </View>
     </KeyboardAvoidingView>
